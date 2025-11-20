@@ -1,0 +1,22 @@
+# ---- C++ ----
+cpp/build/
+cpp/*.obj
+cpp/*.exe
+cpp/*.pdb
+cpp/*.ilk
+cpp/*.pch
+cpp/*.idb
+cpp/*.tlog
+cpp/*.log
+
+# ---- .NET ----
+dotnet/**/bin/
+dotnet/**/obj/
+dotnet/**/.vs/
+dotnet/**/*.user
+dotnet/**/*.suo
+dotnet/**/*.cache
+
+# ---- OS junk ----
+Thumbs.db
+.DS_Store
