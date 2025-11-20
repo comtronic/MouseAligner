@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <shellscalingapi.h>
+
 #include <vector>
 #include <algorithm>
 #include <string>
@@ -8,19 +10,35 @@
 #include <cstdlib>
 #include <cmath>
 
+#pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Shcore.lib")
 
+// ---------- App metadata ----------
+static const wchar_t* kAppName   = L"MouseAligner";
+static const wchar_t* kClassName = L"MouseAlignerTrayWindow";
+static const UINT WM_TRAYICON    = WM_APP + 1;
+static const UINT TRAY_UID       = 1;
+
+// Tray menu commands
+enum TrayCmd : UINT {
+    CMD_TOGGLE_ENABLE = 1001,
+    CMD_RELOAD        = 1002,
+    CMD_EXIT          = 1003
+};
+
 struct MonitorInfo {
-    RECT phys;        // physical px i virtual desktop space
+    RECT phys;        // physical px in virtual desktop space
     double scale;     // dpi/96
     double dipTop;    // phys.top / scale
     double dipHeight; // phys.height / scale
     std::wstring name;
 };
 
-static std::vector<MonitorInfo> g_monitors;
+enum class Mode { Top, Center };
 
+// ---------- Globals ----------
+static std::vector<MonitorInfo> g_monitors;
 static MonitorInfo g_left{}, g_right{};
 static int g_boundaryX = 0;
 
@@ -30,25 +48,35 @@ static bool g_haveLast = false;
 static POINT g_lastPt{};
 
 static bool g_debug = false;
+static bool g_console = false;
 static bool g_listOnly = false;
+static bool g_useTray = true;
+static bool g_enabled = true;
+
 static int g_leftIndex = -1;
 static int g_rightIndex = -1;
 static double g_leftScaleOverride = 0.0;
 static double g_rightScaleOverride = 0.0;
-
-enum class Mode { Top, Center };
 static Mode g_mode = Mode::Top;
 
+static NOTIFYICONDATAW g_nid{};
+static HWND g_hwnd = nullptr;
+
+// ---------- Utils ----------
 static double Clamp(double v, double lo, double hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+static double ParseDouble(const char* s) { return std::strtod(s, nullptr); }
+static int ParseInt(const char* s) { return std::strtol(s, nullptr, 10); }
 
-static double ParseDouble(const char* s) {
-    return std::strtod(s, nullptr);
-}
-
-static int ParseInt(const char* s) {
-    return std::strtol(s, nullptr, 10);
+static void EnsureConsole() {
+    if (g_console || g_debug) {
+        AllocConsole();
+        FILE* f;
+        freopen_s(&f, "CONOUT$", "w", stdout);
+        freopen_s(&f, "CONOUT$", "w", stderr);
+        SetConsoleTitleW(kAppName);
+    }
 }
 
 static double GetScaleForMonitor(HMONITOR hm) {
@@ -58,6 +86,51 @@ static double GetScaleForMonitor(HMONITOR hm) {
     return 1.0;
 }
 
+// ---------- Tray ----------
+static void UpdateTrayTooltip() {
+    if (!g_useTray) return;
+    wchar_t tip[128];
+    swprintf_s(tip, L"%s (%s)", kAppName, g_enabled ? L"Enabled" : L"Disabled");
+    wcsncpy_s(g_nid.szTip, tip, _TRUNCATE);
+    g_nid.uFlags = NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+}
+
+static void AddTrayIcon(HWND hwnd) {
+    if (!g_useTray) return;
+
+    g_nid = {};
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = hwnd;
+    g_nid.uID = TRAY_UID;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+    wcsncpy_s(g_nid.szTip, kAppName, _TRUNCATE);
+
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    UpdateTrayTooltip();
+}
+
+static void RemoveTrayIcon() {
+    if (!g_useTray) return;
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+}
+
+static void ShowTrayMenu(HWND hwnd) {
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, CMD_TOGGLE_ENABLE, g_enabled ? L"Disable" : L"Enable");
+    AppendMenuW(menu, MF_STRING, CMD_RELOAD, L"Reload monitors");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, CMD_EXIT, L"Exit");
+
+    POINT p; GetCursorPos(&p);
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_NONOTIFY, p.x, p.y, 0, hwnd, nullptr);
+    DestroyMenu(menu);
+}
+
+// ---------- Monitor enumeration ----------
 static BOOL CALLBACK EnumMonProc(HMONITOR hm, HDC, LPRECT, LPARAM) {
     MONITORINFOEXW mi{};
     mi.cbSize = sizeof(mi);
@@ -70,14 +143,7 @@ static BOOL CALLBACK EnumMonProc(HMONITOR hm, HDC, LPRECT, LPARAM) {
     double dipTop = phys.top / scale;
     double dipHeight = physHeight / scale;
 
-    MonitorInfo info;
-    info.phys = phys;
-    info.scale = scale;
-    info.dipTop = dipTop;
-    info.dipHeight = dipHeight;
-    info.name = mi.szDevice;
-
-    g_monitors.push_back(info);
+    g_monitors.push_back(MonitorInfo{ phys, scale, dipTop, dipHeight, mi.szDevice });
     return TRUE;
 }
 
@@ -116,20 +182,14 @@ static void ApplyOverrides() {
     }
 }
 
-static void SelectMonitors() {
-    if (g_monitors.size() < 2) {
-        std::puts("Need at least 2 monitors.");
-        std::exit(1);
-    }
+static bool SelectMonitors() {
+    if (g_monitors.size() < 2) return false;
 
     int li = (g_leftIndex >= 0) ? g_leftIndex : 0;
     int ri = (g_rightIndex >= 0) ? g_rightIndex : 1;
 
-    if (li < 0 || ri < 0 || li >= (int)g_monitors.size() || ri >= (int)g_monitors.size() || li == ri) {
-        std::puts("Invalid --left/--right indices.");
-        PrintMonitors();
-        std::exit(1);
-    }
+    if (li < 0 || ri < 0 || li >= (int)g_monitors.size() || ri >= (int)g_monitors.size() || li == ri)
+        return false;
 
     g_left = g_monitors[li];
     g_right = g_monitors[ri];
@@ -138,27 +198,15 @@ static void SelectMonitors() {
         std::swap(g_left, g_right);
 
     ApplyOverrides();
-
     g_boundaryX = g_right.phys.left;
+    return true;
 }
 
-static void PrintStartup() {
-    auto& L = g_left;
-    auto& R = g_right;
-    std::printf("MouseFix running.\n");
-    std::printf("Left : %ls  phys=[%ld,%ld - %ld,%ld]  scale=%.3f dipH=%.1f\n",
-        L.name.c_str(), L.phys.left, L.phys.top, L.phys.right, L.phys.bottom, L.scale, L.dipHeight);
-    std::printf("Right: %ls  phys=[%ld,%ld - %ld,%ld]  scale=%.3f dipH=%.1f\n",
-        R.name.c_str(), R.phys.left, R.phys.top, R.phys.right, R.phys.bottom, R.scale, R.dipHeight);
-    std::printf("BoundaryX=%d  mode=%s  (use --debug for logs)\n",
-        g_boundaryX, g_mode == Mode::Top ? "top" : "center");
-}
-
+// ---------- Warp logic ----------
 static void WarpDipAligned(bool leftToRight, int srcYPhys) {
     const MonitorInfo& from = leftToRight ? g_left : g_right;
     const MonitorInfo& to   = leftToRight ? g_right : g_left;
 
-    // srcY in DIP
     double srcYDip = srcYPhys / from.scale;
 
     double relDip = 0.0;
@@ -168,18 +216,18 @@ static void WarpDipAligned(bool leftToRight, int srcYPhys) {
         relDip = (srcYDip - from.dipTop) / from.dipHeight;
         relDip = Clamp(relDip, 0.0, 1.0);
         newYDip = to.dipTop + relDip * to.dipHeight;
-    } else { // center mode
-        double fromCenterDip = from.dipTop + from.dipHeight * 0.5;
-        double toCenterDip   = to.dipTop + to.dipHeight * 0.5;
-        double relCenter = (srcYDip - fromCenterDip) / from.dipHeight; // ~[-0.5,0.5]
-        newYDip = toCenterDip + relCenter * to.dipHeight;
-        relDip = (newYDip - to.dipTop) / to.dipHeight; // for debug
+    } else {
+        double fromCenter = from.dipTop + from.dipHeight * 0.5;
+        double toCenter   = to.dipTop + to.dipHeight * 0.5;
+        double relCenter  = (srcYDip - fromCenter) / from.dipHeight;
+        newYDip = toCenter + relCenter * to.dipHeight;
+
+        relDip = (newYDip - to.dipTop) / to.dipHeight;
         relDip = Clamp(relDip, 0.0, 1.0);
     }
 
     int newYPhys = (int)std::llround(newYDip * to.scale);
 
-    // clamp within target monitor's physical bounds
     if (newYPhys < to.phys.top) newYPhys = to.phys.top;
     if (newYPhys >= to.phys.bottom) newYPhys = to.phys.bottom - 1;
 
@@ -193,11 +241,11 @@ static void WarpDipAligned(bool leftToRight, int srcYPhys) {
     g_warpInProgress = true;
     SetCursorPos(newXPhys, newYPhys);
 
-    g_lastPt.x = newXPhys;
-    g_lastPt.y = newYPhys;
+    g_lastPt = { newXPhys, newYPhys };
     g_haveLast = true;
 }
 
+// ---------- Low-level mouse hook ----------
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && wParam == WM_MOUSEMOVE) {
         if (g_warpInProgress) {
@@ -210,35 +258,85 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
         if (g_haveLast) {
             if (g_lastPt.x < g_boundaryX && x >= g_boundaryX) {
-                if (g_debug)
-                    std::printf("Cross L->R from (%ld,%ld) to (%d,%d)\n",
-                        g_lastPt.x, g_lastPt.y, x, y);
-                WarpDipAligned(true, g_lastPt.y);
-                return 1;
+                if (g_debug) std::printf("Cross L->R (%ld,%ld)->(%d,%d)\n", g_lastPt.x, g_lastPt.y, x, y);
+                if (g_enabled) {
+                    WarpDipAligned(true, g_lastPt.y);
+                    return 1;
+                }
             }
-
             if (g_lastPt.x >= g_boundaryX && x < g_boundaryX) {
-                if (g_debug)
-                    std::printf("Cross R->L from (%ld,%ld) to (%d,%d)\n",
-                        g_lastPt.x, g_lastPt.y, x, y);
-                WarpDipAligned(false, g_lastPt.y);
-                return 1;
+                if (g_debug) std::printf("Cross R->L (%ld,%ld)->(%d,%d)\n", g_lastPt.x, g_lastPt.y, x, y);
+                if (g_enabled) {
+                    WarpDipAligned(false, g_lastPt.y);
+                    return 1;
+                }
             }
         }
 
-        g_lastPt.x = x;
-        g_lastPt.y = y;
+        g_lastPt = { x, y };
         g_haveLast = true;
     }
 
     return CallNextHookEx(g_hook, nCode, wParam, lParam);
 }
 
+// ---------- Window proc ----------
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE:
+            AddTrayIcon(hwnd);
+            return 0;
+
+        case WM_TRAYICON:
+            if (lParam == WM_RBUTTONUP) {
+                ShowTrayMenu(hwnd);
+            } else if (lParam == WM_LBUTTONUP) {
+                g_enabled = !g_enabled;
+                UpdateTrayTooltip();
+                if (g_debug) std::printf("Enabled=%d\n", g_enabled ? 1 : 0);
+            }
+            return 0;
+
+        case WM_COMMAND:
+            switch (LOWORD(wParam)) {
+                case CMD_TOGGLE_ENABLE:
+                    g_enabled = !g_enabled;
+                    UpdateTrayTooltip();
+                    if (g_debug) std::printf("Enabled=%d\n", g_enabled ? 1 : 0);
+                    break;
+
+                case CMD_RELOAD:
+                    EnumerateMonitors();
+                    if (!SelectMonitors()) {
+                        if (g_debug) std::printf("Reload failed: invalid monitor selection\n");
+                    } else {
+                        if (g_debug) std::printf("Monitors reloaded. BoundaryX=%d\n", g_boundaryX);
+                    }
+                    UpdateTrayTooltip();
+                    break;
+
+                case CMD_EXIT:
+                    PostQuitMessage(0);
+                    break;
+            }
+            return 0;
+
+        case WM_DESTROY:
+            RemoveTrayIcon();
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ---------- Args ----------
 static void ParseArgs(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
 
         if (a == "--debug") g_debug = true;
+        else if (a == "--console") g_console = true;
+        else if (a == "--no-tray") g_useTray = false;
         else if (a == "--list") g_listOnly = true;
         else if (a == "--left" && i + 1 < argc) g_leftIndex = ParseInt(argv[++i]);
         else if (a == "--right" && i + 1 < argc) g_rightIndex = ParseInt(argv[++i]);
@@ -249,40 +347,86 @@ static void ParseArgs(int argc, char** argv) {
             if (m == "top") g_mode = Mode::Top;
             else if (m == "center") g_mode = Mode::Center;
             else {
+                EnsureConsole();
                 std::puts("Invalid --mode. Use top|center.");
                 std::exit(1);
             }
         } else {
+            EnsureConsole();
             std::puts("Unknown arg.");
             std::printf("Usage:\n");
-            std::printf("  mouse_fix.exe [--list] [--left N --right M] [--left-scale S --right-scale S] [--mode top|center] [--debug]\n");
+            std::printf("  MouseAligner.exe [--list] [--left N --right M]\n");
+            std::printf("                   [--left-scale S --right-scale S]\n");
+            std::printf("                   [--mode top|center] [--debug] [--console] [--no-tray]\n");
             std::exit(1);
         }
     }
 }
 
-int main(int argc, char** argv) {
-    ParseArgs(argc, argv);
+// ---------- Entry point (GUI subsystem) ----------
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    int argc = 0;
+    auto argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::vector<std::string> argvA;
+    argvA.reserve(argc);
 
-    // Per-monitor DPI aware v2 so we get physical bounds + correct DPI
+    // convert wide argv to utf8-ish narrow for simple parsing
+    for (int i = 0; i < argc; ++i) {
+        char buf[512]{};
+        WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, buf, (int)sizeof(buf), nullptr, nullptr);
+        argvA.emplace_back(buf);
+    }
+    LocalFree(argvW);
+
+    std::vector<char*> argvPtrs;
+    argvPtrs.reserve(argvA.size());
+    for (auto& s : argvA) argvPtrs.push_back(s.data());
+
+    ParseArgs((int)argvPtrs.size(), argvPtrs.data());
+
+    // DPI aware so bounds are physical px
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    EnumerateMonitors();
+    EnsureConsole();
 
+    EnumerateMonitors();
     if (g_listOnly) {
         PrintMonitors();
         return 0;
     }
 
-    SelectMonitors();
-    PrintStartup();
+    if (!SelectMonitors()) {
+        if (!g_debug && !g_console) AllocConsole(); // show error at least once
+        std::puts("Failed to select monitors. Use --list to see options.");
+        return 1;
+    }
 
+    if (g_debug) {
+        std::printf("%ls starting. mode=%s boundaryX=%d\n",
+            kAppName, g_mode == Mode::Top ? "top" : "center", g_boundaryX);
+    }
+
+    // Create hidden window (message-only). Tray icon hooks into this.
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kClassName;
+    RegisterClassW(&wc);
+
+    g_hwnd = CreateWindowExW(
+        0, kClassName, L"", 0,
+        0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+
+    // Hook mouse globally
     g_hook = SetWindowsHookExW(WH_MOUSE_LL, MouseProc, GetModuleHandleW(nullptr), 0);
     if (!g_hook) {
+        if (!g_debug && !g_console) AllocConsole();
         std::printf("SetWindowsHookEx failed: %lu\n", GetLastError());
         return 1;
     }
 
+    // Message loop
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
